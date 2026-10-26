@@ -26,9 +26,11 @@ from scenedetect import (
     FrameTimecode,
     SceneManager,
     VideoStreamCv2,
+    __version__,
     open_video,
     save_images,
 )
+from scenedetect.common import Timecode
 from scenedetect.output import (
     SceneMetadata,
     VideoMetadata,
@@ -320,6 +322,13 @@ def _fake_scenes(fps: Fraction, frames):
     return [(FrameTimecode(start, fps=fps), FrameTimecode(end, fps=fps)) for start, end in frames]
 
 
+def _opencv_timecode(seconds: float, fps: Fraction) -> FrameTimecode:
+    """Construct a position using OpenCV's microsecond PTS representation."""
+    ms = seconds * 1000
+    timecode = Timecode(pts=round(ms * 1000), time_base=Fraction(1, 1000000))
+    return FrameTimecode(timecode=timecode, fps=fps)
+
+
 _OUTPUT_TARGET_KINDS = ("file_handle", "str", "path", "bytes")
 
 
@@ -406,6 +415,70 @@ def test_write_scene_list_edl(tmp_path: Path):
     assert "FCM: NON-DROP FRAME" in content
     assert "001  AX V     C        00:00:00:00 00:00:01:00 00:00:00:00 00:00:01:00" in content
     assert "002  AX V     C        00:00:01:00 00:00:02:00 00:00:01:00 00:00:02:00" in content
+
+
+@pytest.mark.parametrize(
+    "fps,frames",
+    [
+        (_FPS_NTSC, 86400),
+        (Fraction(30000, 1001), 108000),
+        (Fraction(60000, 1001), 216000),
+        (Fraction(2997, 100), 108000),
+        (Fraction(14000, 1001), 50400),
+    ],
+)
+@pytest.mark.parametrize("from_seconds", [False, True])
+def test_write_scene_list_edl_fractional_rate(fps: Fraction, frames: int, from_seconds: bool):
+    """Non-drop-frame timecodes count frames at nominal fps, including rounded timestamps."""
+    scenes = _fake_scenes(fps, [(0, frames), (frames, frames + 1)])
+    if from_seconds:
+        scenes = [
+            (_opencv_timecode(start.seconds, fps), _opencv_timecode(end.seconds, fps))
+            for start, end in scenes
+        ]
+    output = StringIO()
+    write_scene_list_edl(output, scenes)
+
+    content = output.getvalue()
+    assert "001  AX V     C        00:00:00:00 01:00:00:00 00:00:00:00 01:00:00:00" in content
+    assert "002  AX V     C        01:00:00:00 01:00:00:01 01:00:00:00 01:00:00:01" in content
+
+
+@pytest.mark.parametrize("fps", [24, 25, 30, 60])
+def test_write_scene_list_edl_integer_rate(fps: int):
+    """Exact frame timecodes at integer rates retain byte-for-byte compatible EDL output."""
+    scenes = _fake_scenes(Fraction(fps), [(0, fps * 3600), (fps * 3600, fps * 3601 + fps // 2)])
+    output = StringIO()
+    write_scene_list_edl(output, scenes)
+
+    assert output.getvalue() == (
+        f"* CREATED WITH PYSCENEDETECT {__version__}\n"
+        "TITLE: PySceneDetect\n"
+        "FCM: NON-DROP FRAME\n"
+        "\n"
+        "001  AX V     C        00:00:00:00 01:00:00:00 00:00:00:00 01:00:00:00\n"
+        f"002  AX V     C        01:00:00:00 01:00:01:{fps // 2:02d} 01:00:00:00 01:00:01:{fps // 2:02d}\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "fps,seconds,expected",
+    [
+        pytest.param(Fraction(24), 50 / 24, "00:00:02:02", id="24fps-frame50"),
+        pytest.param(Fraction(240009, 10000), 1200.0, "00:20:00:00", id="24.0009fps"),
+        pytest.param(Fraction(34651, 2108), 120.0, "00:02:00:00", id="vfr-average"),
+        pytest.param(Fraction(1, 2), 2.0, "00:00:02:00", id="0.5fps"),
+    ],
+)
+def test_write_scene_list_edl_opencv_timecode(fps: Fraction, seconds: float, expected: str):
+    """OpenCV timestamps use nominal frame counts only at standard rates."""
+    scenes = [(_opencv_timecode(0.0, fps), _opencv_timecode(seconds, fps))]
+    output = StringIO()
+    write_scene_list_edl(output, scenes)
+
+    assert (
+        f"001  AX V     C        00:00:00:00 {expected} 00:00:00:00 {expected}" in output.getvalue()
+    )
 
 
 @pytest.mark.parametrize("target_kind", _OUTPUT_TARGET_KINDS)
@@ -498,6 +571,40 @@ def test_write_scene_list_edl_with_start_timecode_out_of_range(tmp_path: Path, b
     scenes = _fake_scenes(_FPS_CFR, [(0, 30)])
     with pytest.raises(ValueError):
         write_scene_list_edl(tmp_path / "scenes.edl", scenes, start_timecode=bad_value)
+
+
+@pytest.mark.parametrize(
+    "fps,start_timecode,expected_in,expected_out",
+    [
+        (Fraction(34651, 2108), "00:00:02:16", "00:00:02:16", "00:00:03:00"),
+        (Fraction(1, 2), "00:00:04:00", "00:00:04:00", "00:00:06:00"),
+    ],
+)
+def test_write_scene_list_edl_nonstandard_rate_start_timecode(
+    fps: Fraction, start_timecode: str, expected_in: str, expected_out: str
+):
+    """Nonstandard start offsets retain real-rate frame counts and the ceiling FF limit."""
+    scenes = _fake_scenes(fps, [(0, 1)])
+    output = StringIO()
+    write_scene_list_edl(output, scenes, start_timecode=start_timecode)
+
+    assert (
+        f"001  AX V     C        {expected_in} {expected_out} {expected_in} {expected_out}"
+        in output.getvalue()
+    )
+
+
+@pytest.mark.parametrize("start_timecode", ["01:00:00:00", "01000000"])
+def test_write_scene_list_edl_fractional_rate_start_timecode(start_timecode: str):
+    """Start timecodes use the same nominal frame rate as EDL event timecodes."""
+    scenes = _fake_scenes(Fraction(30000, 1001), [(0, 50)])
+    output = StringIO()
+    write_scene_list_edl(output, scenes, start_timecode=start_timecode)
+
+    assert (
+        "001  AX V     C        01:00:00:00 01:00:01:20 01:00:00:00 01:00:01:20"
+        in output.getvalue()
+    )
 
 
 def test_write_scene_list_fcpx(tmp_path: Path):

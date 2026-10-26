@@ -40,6 +40,7 @@ from scenedetect.common import (
     CutList,
     FrameTimecode,
     SceneList,
+    framerate_to_fraction,
 )
 
 # Commonly used classes/functions exported under the `scenedetect.output` namespace for brevity.
@@ -332,15 +333,31 @@ def write_scene_list_html(
     page.save(output_html_filename)
 
 
+def _edl_nominal_rate(frame_rate: Fraction | float) -> int | None:
+    """Return the nominal rate for integer or NTSC rates, allowing rounded decimal inputs."""
+    rate = framerate_to_fraction(float(frame_rate))
+    nominal = round(rate)
+    if nominal >= 1 and rate in (nominal, Fraction(nominal * 1000, 1001)):
+        return nominal
+    return None
+
+
 def _edl_timecode(timecode: FrameTimecode) -> str:
-    """Format `timecode` as ``HH:MM:SS:FF`` for a CMX 3600 EDL entry."""
-    total_seconds = timecode.seconds
+    """Format `timecode` as non-drop-frame ``HH:MM:SS:FF`` for a CMX 3600 EDL entry."""
     frame_rate = timecode.frame_rate
     assert frame_rate is not None
-    hours = int(total_seconds // 3600)
-    minutes = int((total_seconds % 3600) // 60)
-    seconds = int(total_seconds % 60)
-    frames_part = int((total_seconds * frame_rate) % frame_rate)
+    nominal = _edl_nominal_rate(frame_rate)
+    if nominal is not None:
+        # Non-drop-frame timecode counts 24 frames per timecode second even at 23.976 fps.
+        total_seconds, frames_part = divmod(timecode.frame_num, nominal)
+        total_minutes, seconds = divmod(total_seconds, 60)
+        hours, minutes = divmod(total_minutes, 60)
+    else:
+        total_seconds = timecode.seconds
+        hours = int(total_seconds // 3600)
+        minutes = int((total_seconds % 3600) // 60)
+        seconds = int(total_seconds % 60)
+        frames_part = int((total_seconds * frame_rate) % frame_rate)
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}:{frames_part:02d}"
 
 
@@ -360,11 +377,14 @@ def _parse_edl_start_timecode(value: str, frame_rate: Fraction | float) -> int:
             f"Invalid start timecode {value!r}: expected HH:MM:SS:FF or 8 digits (HHMMSSFF)."
         )
     hours, minutes, seconds, frames = (int(p) for p in parts)
-    max_frames = math.ceil(float(frame_rate))
+    nominal = _edl_nominal_rate(frame_rate)
+    max_frames = nominal if nominal is not None else math.ceil(float(frame_rate))
     if minutes >= 60 or seconds >= 60 or frames >= max_frames:
         raise ValueError(
             f"Invalid start timecode {value!r}: MM<60, SS<60, FF<{max_frames} required."
         )
+    if nominal is not None:
+        return ((hours * 60 + minutes) * 60 + seconds) * nominal + frames
     return round((hours * 3600 + minutes * 60 + seconds) * float(frame_rate)) + frames
 
 
